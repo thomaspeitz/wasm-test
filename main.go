@@ -7,82 +7,91 @@ import (
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
 )
 
+// Domain to market mapping
+var domainMap = map[string]string{
+	"www.example.com": "test",
+}
+
 func main() {
 	proxywasm.SetVMContext(&vmContext{})
 }
 
-// Domain to market mapping
-var domainMap = map[string]string{
-	// Test domain
-	"www.example.com": "test",
+type vmContext struct {
+	types.DefaultVMContext
 }
 
-type vmContext struct{}
-
-func (*vmContext) OnVMStart(vmConfigurationSize int) types.OnVMStartStatus {
-	proxywasm.LogInfo("market-header WASM plugin initialized")
-	return types.OnVMStartStatusOK
-}
-
+// Override types.DefaultVMContext.
 func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
-	return &pluginContext{}
+	return &pluginContext{contextID: contextID}
 }
 
 type pluginContext struct {
 	types.DefaultPluginContext
+	contextID uint32
 }
 
+// Override types.DefaultPluginContext.
+func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
+	proxywasm.LogInfof("market-header plugin started, contextID: %d", ctx.contextID)
+	return types.OnPluginStartStatusOK
+}
+
+// Override types.DefaultPluginContext.
 func (*pluginContext) NewHttpContext(contextID uint32) types.HttpContext {
-	return &httpContext{}
+	return &httpMarketHeader{contextID: contextID}
 }
 
-type httpContext struct {
+type httpMarketHeader struct {
 	types.DefaultHttpContext
+	contextID uint32
+	market    string
 }
 
-func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) types.Action {
-	// Get the :authority header (host)
+func (ctx *httpMarketHeader) OnHttpRequestHeaders(int, bool) types.Action {
 	authority, err := proxywasm.GetHttpRequestHeader(":authority")
 	if err != nil {
 		proxywasm.LogWarnf("failed to get :authority header: %v", err)
 		return types.ActionContinue
 	}
 
-	// Remove port if present (e.g., "example.com:8080" -> "example.com")
+	// Remove port if present
 	host := authority
 	if idx := strings.Index(authority, ":"); idx != -1 {
 		host = authority[:idx]
 	}
 
-	// Try exact domain match first
+	// Try exact domain match
 	if market, ok := domainMap[host]; ok {
-		ctx.addMarketHeaders(market, host)
+		ctx.market = market
+		proxywasm.AddHttpRequestHeader("x-request-market", market)
+		proxywasm.AddHttpRequestHeader("x-market", market)
+		proxywasm.LogInfof("set market: %s for host: %s", market, host)
 		return types.ActionContinue
 	}
 
-	// Try nonprod subdomain pattern (e.g., "at.nonprod.example.com" -> "at")
+	// Try subdomain pattern (e.g., "at.nonprod.example.com" -> "at")
 	parts := strings.Split(host, ".")
 	if len(parts) >= 2 {
 		prefix := parts[0]
-		// Check if it's a 2-letter market code (all lowercase)
 		if len(prefix) == 2 && isLowerAlpha(prefix) {
-			ctx.addMarketHeaders(prefix, host)
+			ctx.market = prefix
+			proxywasm.AddHttpRequestHeader("x-request-market", prefix)
+			proxywasm.AddHttpRequestHeader("x-market", prefix)
+			proxywasm.LogInfof("set market: %s for host: %s", prefix, host)
 			return types.ActionContinue
 		}
 	}
 
-	proxywasm.LogInfof("no market mapping found for host: %s", host)
+	proxywasm.LogInfof("no market mapping for host: %s", host)
 	return types.ActionContinue
 }
 
-func (ctx *httpContext) addMarketHeaders(market, host string) {
-	if err := proxywasm.AddHttpRequestHeader("x-request-market", market); err != nil {
-		proxywasm.LogWarnf("failed to add x-request-market header: %v", err)
+func (ctx *httpMarketHeader) OnHttpResponseHeaders(int, bool) types.Action {
+	proxywasm.AddHttpResponseHeader("x-wasm-filter", "market-header")
+	if ctx.market != "" {
+		proxywasm.AddHttpResponseHeader("x-market-debug", ctx.market)
 	}
-	if err := proxywasm.AddHttpRequestHeader("x-market", market); err != nil {
-		proxywasm.LogWarnf("failed to add x-market header: %v", err)
-	}
-	proxywasm.LogInfof("set market header: %s for host: %s", market, host)
+	return types.ActionContinue
 }
 
 func isLowerAlpha(s string) bool {
